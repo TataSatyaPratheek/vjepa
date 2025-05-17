@@ -1,0 +1,65 @@
+# @package _global_
+defaults:
+  - _self_
+  - model: vjepa_tiny
+  - data: hmdb51
+  - trainer: mps
+  - diffusion: latent_diffusion
+  - callbacks: default
+  - logger: null
+  - paths: default
+  - hydra: default
+
+seed: 42
+task_name: "vjepa_hmdb51"
+tags: ["latent_space", "m1_optimized"]
+
+train:
+  enable: True
+  resume: False
+  ckpt_path: null
+
+model:
+  encoder:
+    name: "vit_tiny"
+    pretrained: "google/vit-tiny-patch16-224"
+    frozen: True
+    gradient_checkpointing: True
+  
+  predictor:
+    hidden_dim: 128
+    num_layers: 2
+    dropout: 0.1
+
+  latent_dim: 192
+  mask_ratio: 0.75
+  tube_mask: True
+
+data:
+  root_dir: "data/hmdb51/processed"
+  clip_length: 8
+  frame_size: 128
+  num_workers: 2
+  persistent_workers: True
+  batch_size: 2
+  num_frames: 16
+  frame_rate: 5
+
+diffusion:
+  timesteps: 1000
+  beta_schedule: "linear"
+  unet_channels: [64, 128]
+  attention_resolutions: [16]
+  num_res_blocks: 2
+
+optimization:
+  lr: 1e-4
+  weight_decay: 0.01
+  max_epochs: 100
+  warmup_epochs: 10
+  grad_clip: 0.5
+  use_amp: True
+
+logging:
+  latent_viz_interval: 1000
+  save_samples: 16
