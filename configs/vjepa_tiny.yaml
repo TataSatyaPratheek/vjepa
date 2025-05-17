@@ -3,7 +3,7 @@ defaults:
   - _self_
   - model: vjepa_tiny
   - data: hmdb51
-  - trainer: mps
+  - trainer: m1_optimized
   - diffusion: latent_diffusion
   - callbacks: default
   - logger: null
@@ -12,7 +12,7 @@ defaults:
 
 seed: 42
 task_name: "vjepa_hmdb51"
-tags: ["latent_space", "m1_optimized"]
+tags: ["latent_space", "m1_8gb_optimized"]
 
 train:
   enable: True
@@ -38,28 +38,29 @@ model:
 data:
   root_dir: "data/hmdb51/processed"
   clip_length: 8
-  frame_size: 128
+  frame_size: 112  # Reduced from 128 for M1 memory
   num_workers: 2
-  persistent_workers: True
-  batch_size: 2
-  num_frames: 16
+  persistent_workers: False
+  batch_size: 1  # Reduced for M1 8GB
+  num_frames: 8  # Reduced from 16 for M1 memory
   frame_rate: 5
 
 diffusion:
-  timesteps: 1000
+  timesteps: 500  # Reduced for faster generation on M1
   beta_schedule: "linear"
-  unet_channels: [64, 128]
+  unet_channels: [32, 64]  # Smaller channels for M1
   attention_resolutions: [16]
-  num_res_blocks: 2
+  num_res_blocks: 1  # Reduced for M1 memory
 
 optimization:
-  lr: 1e-4
+  lr: 5e-5  # Lower learning rate for stability
   weight_decay: 0.01
-  max_epochs: 100
+  max_epochs: 30  # Fewer epochs for M1
   warmup_epochs: 10
   grad_clip: 0.5
   use_amp: True
+  accumulate_grad_batches: 4  # Gradient accumulation for effective batch size
 
 logging:
-  latent_viz_interval: 1000
-  save_samples: 16
+  latent_viz_interval: 2000
+  save_samples: 4  # Reduced sample count for M1 memory

@@ -1,8 +1,14 @@
-torch>=2.0
+torch>=2.1.0
 torchvision
-pytorch-lightning
+lightning>=2.0.0
 pytorchvideo
+accelerate>=0.20.0
 einops
 kornia
 matplotlib
 tqdm
+safetensors
+transformers>=4.30.0
+diffusers>=0.22.0
+datasets
+timm
