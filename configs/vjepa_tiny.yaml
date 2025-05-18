@@ -22,7 +22,7 @@ train:
 model:
   encoder:
     name: "vit_tiny"
-    pretrained: "google/vit-tiny-patch16-224"
+    pretrained: "google/vit-base-patch16-224"
     frozen: True
     gradient_checkpointing: True
   
