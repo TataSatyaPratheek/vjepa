@@ -46,7 +46,7 @@ model:
 data:
   root_dir: "data/hmdb51/processed"
   clip_length: 8
-  frame_size: 112  # Reduced from 128 for M1 memory
+  frame_size: 224  # Reduced from 128 for M1 memory
   num_workers: 2
   persistent_workers: False
   batch_size: 1  # Reduced for M1 8GB

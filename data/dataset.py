@@ -126,7 +126,7 @@ class HMDB51Wrapper:
         split: str = 'train', 
         clip_length: int = 8, 
         frame_rate: int = 5,
-        frame_size: int = 112,
+        frame_size: int = 224,
         cache_mode: str = 'none'  # Options: 'none', 'memory', 'disk'
     ):
         # Setup logging

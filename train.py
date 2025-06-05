@@ -152,9 +152,7 @@ class VJEPATrainer(L.LightningModule):
         self.config = config or {}
         # Save hyperparameters, but ignore large objects
         self.save_hyperparameters(ignore=['model'])
-        
-        # Setup logger
-        self.log_dict = {}
+        # No need to initialize log_dict - it's a Lightning method
         
         # Training configuration
         self.lr = self.config.get('lr', 1e-4)
@@ -232,12 +230,17 @@ class VJEPATrainer(L.LightningModule):
         # Try with autocast, fall back if it fails
         try:
             # MPS-specific mixed precision - use float16 instead of bfloat16 for M1
-            device_type = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+            # Fix autocast device type for MPS
+            if torch.cuda.is_available():
+                device_type = 'cuda'
+            elif torch.backends.mps.is_available():
+                device_type = 'cpu'  # Use CPU autocast for MPS to avoid warnings
+            else:
+                device_type = 'cpu'
             dtype = torch.float16
 
-            with torch.autocast(device_type=device_type, dtype=dtype, enabled=device_type != 'cpu'):
+            with torch.autocast(device_type='cpu', dtype=torch.float32, enabled=False):  # Disable autocast for MPS
                 # Forward pass with context and target
-                # The model's forward should handle x_target and masks_target
                 pred_features, context_features, target_features = self.model(
                     x=video_context,  # Masked video for context encoder
                     x_target=video_target, # Original video for target encoder
@@ -257,14 +260,19 @@ class VJEPATrainer(L.LightningModule):
                     # We need to convert this to a boolean mask for features [B, T]
                     # A frame is considered for loss if *any* part of it was specified by the target mask.
                     target_frames_mask = masks_target.squeeze(2).any(dim=(-1, -2))  # [B, T], boolean
-
-                    loss = F.mse_loss(
-                        pred_features[target_frames_mask],
-                        target_features[target_frames_mask]
-                    )
+                    
+                    # Ensure we have valid masks and features
+                    if target_frames_mask.any():
+                        loss = F.mse_loss(
+                            pred_features[target_frames_mask],
+                            target_features[target_frames_mask]
+                        )
+                    else:
+                        # Fallback if no target frames are masked
+                        loss = F.mse_loss(pred_features, target_features)
                 else: # Fallback if target_features are not available (e.g. model error)
                     log.warning("Target features are None, using simplified self-supervised loss.")
-                    loss = F.mse_loss(pred_features, context_features) # Or another appropriate loss
+                    loss = F.mse_loss(pred_features, context_features) if context_features is not None else torch.tensor(0.0, device=pred_features.device, requires_grad=True)
         except Exception as e:
             log.error(f"Error in autocast block: {e}. Trying without autocast...")
             # Fallback without autocast
@@ -274,10 +282,13 @@ class VJEPATrainer(L.LightningModule):
             video_context = None
             if target_features is not None:
                 target_frames_mask = masks_target.squeeze(2).any(dim=(-1, -2)) # [B,T], boolean
-                loss = F.mse_loss(pred_features[target_frames_mask], target_features[target_frames_mask])
+                if target_frames_mask.any():
+                    loss = F.mse_loss(pred_features[target_frames_mask], target_features[target_frames_mask])
+                else:
+                    loss = F.mse_loss(pred_features, target_features)
             else:
-                loss = F.mse_loss(pred_features, context_features) if context_features is not None else torch.tensor(0.0, device=pred_features.device)
-
+                loss = F.mse_loss(pred_features, context_features) if context_features is not None else torch.tensor(0.0, device=pred_features.device, requires_grad=True)
+ 
         # Update target encoder with momentum
         current_step_in_epoch = self.global_step % (len(self.trainer.train_dataloader) // self.accum_grad_batches)
         current_epoch_effective_steps = len(self.trainer.train_dataloader) // self.accum_grad_batches
@@ -301,8 +312,10 @@ class VJEPATrainer(L.LightningModule):
             self.manual_backward(loss)
             
             if not is_accumulating or (batch_idx + 1) == self.trainer.num_training_batches:
-                # Clip gradients to prevent instability
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_val)
+                # Only clip gradients for trainable parameters
+                trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                if trainable_params:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, self.grad_clip_val)
                 opt.step()
                 
                 # Log step completion with accumulated batches
@@ -331,8 +344,12 @@ class VJEPATrainer(L.LightningModule):
 
     def configure_optimizers(self):
         """Configure optimizers with warmup and weight decay"""
-        params = filter(lambda p: p.requires_grad, self.model.parameters())
+        # Only optimize parameters that require gradients (exclude frozen target encoder)
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         
+        if not trainable_params:
+            log.warning("No trainable parameters found in model! Optimizer will not be configured.")
+            return None # Or raise ValueError("No trainable parameters found in model!")
         # Group parameters by weight decay
         no_decay = ['bias', 'LayerNorm.weight', 'layernorm.weight']
         params_groups = [
@@ -348,6 +365,11 @@ class VJEPATrainer(L.LightningModule):
             }
         ]
         
+        # Filter out empty parameter groups
+        params_groups = [group for group in params_groups if group['params']]
+        if not params_groups:
+            log.warning("No parameters to optimize after filtering for requires_grad and decay groups.")
+            return None
         return AdamW(
             params_groups,
             lr=self.lr, 
@@ -432,7 +454,7 @@ def train():
             split='train', 
             clip_length=8, 
             frame_rate=5,
-            frame_size=112,
+            frame_size=224,
             cache_mode='none'  # Set to 'memory' for faster training if you have enough RAM
         )
         
