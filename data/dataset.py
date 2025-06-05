@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 from typing import Any, Dict, List, Optional, Tuple
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+from PIL import Image
 import random
 import av
 import glob
@@ -182,20 +183,20 @@ class HMDB51Wrapper:
             else:  # 'test'
                 self.video_files = self.video_files[split_idx:]
                 
-        # Transforms - with correct normalization values!
+        # Transforms - handle numpy arrays properly
         self.transforms = Compose([
-            Resize((frame_size, frame_size)),
+            ToTensor(),  # Converts numpy array [H,W,C] to tensor [C,H,W] and scales to [0,1]
+            Resize((frame_size, frame_size)),  # Now works on tensors
             CenterCrop(frame_size),
-            ToTensor(),
             Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
         
         self.logger.info(f"Loaded {len(self.video_files)} video clips from {len(self.classes)} classes")
     
     def __getitem__(self, index: int):
+        video_path, label = self.video_files[index] # Define label early for except block
         # Process videos efficiently
         try:
-            video_path, label = self.video_files[index]
             
             # Check cache
             if self.cache_mode != 'none' and video_path in self.cache:
@@ -213,10 +214,34 @@ class HMDB51Wrapper:
             # Apply transforms to each frame
             transformed_frames = []
             for frame in frames:
-                # Convert numpy array to tensor and apply transforms
-                transformed = self.transforms(frame)
+                # Ensure frame is numpy array and apply transforms
+                if isinstance(frame, np.ndarray):
+                    # PyAV should provide RGB. OpenCV fallback in VideoReader also converts to RGB.
+                    # If frame.shape[-1] == 3: # Color image
+                    #     pass # Assume RGB
+                    transformed = self.transforms(frame)
+                else:
+                    # Handle unexpected frame type
+                    self.logger.warning(f"Unexpected frame type: {type(frame)} for {video_path}. Attempting conversion.")
+                    if isinstance(frame, Image.Image):
+                        frame = np.array(frame.convert("RGB")) # Ensure RGB
+                    elif hasattr(frame, 'to_ndarray'): # For av.VideoFrame
+                        frame = frame.to_ndarray(format='rgb24')
+                    elif hasattr(frame, 'numpy'): # For torch.Tensor or similar
+                        frame = frame.numpy()
+                    else:
+                        self.logger.error(f"Cannot convert frame of type {type(frame)} to numpy array for {video_path}. Skipping frame.")
+                        continue
+                    transformed = self.transforms(frame)
                 transformed_frames.append(transformed)
             
+            if not transformed_frames:
+                self.logger.warning(f"No valid frames extracted from {video_path}, using zero tensor.")
+                return torch.zeros(self.clip_length, 3, self.frame_size, self.frame_size), torch.tensor(label)
+
+            # Pad or truncate frames to ensure fixed clip_length
+            transformed_frames = self._pad_or_truncate_frames(transformed_frames)
+
             # Stack frames to create video tensor [T, C, H, W]
             video_tensor = torch.stack(transformed_frames)
             
@@ -228,8 +253,20 @@ class HMDB51Wrapper:
             
         except Exception as e:
             self.logger.error(f"Error loading video at index {index}: {e}")
+            import traceback
+            self.logger.debug(f"Full traceback for {video_path}: {traceback.format_exc()}")
             # Return a small zero tensor as fallback
-            return torch.zeros(self.clip_length, 3, self.frame_size, self.frame_size), torch.tensor(label) if 'label' in locals() else torch.tensor(0)
+            return torch.zeros(self.clip_length, 3, self.frame_size, self.frame_size), torch.tensor(label)
     
     def __len__(self):
         return len(self.video_files)
+
+    def _pad_or_truncate_frames(self, frames: List[torch.Tensor]) -> List[torch.Tensor]:
+        num_frames = len(frames)
+        if num_frames < self.clip_length:
+            # Pad with the last frame
+            padding = [frames[-1]] * (self.clip_length - num_frames)
+            frames.extend(padding)
+        elif num_frames > self.clip_length:
+            frames = frames[:self.clip_length]
+        return frames
