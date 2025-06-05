@@ -60,10 +60,18 @@ class TinyVJEPA(nn.Module):
                         torch_dtype=torch.float16,
                         local_files_only=True
                     )
-                    logger.info(f"Loaded model from local cache: {pretrained}")
+                    # Attempt to load target_encoder from local cache as well
+                    self.target_encoder = ViTModel.from_pretrained(
+                        pretrained,
+                        use_safetensors=True,
+                        torch_dtype=torch.float16,
+                        local_files_only=True
+                    )
+                    self.target_encoder.requires_grad_(False) # Ensure target encoder is frozen
+                    logger.info(f"Loaded encoder and target_encoder from local cache: {pretrained}")
                 except Exception as local_error:
                     # If that fails too, use a specific fallback model that's included
-                    logger.error(f"Local loading also failed: {local_error}")
+                    logger.error(f"Local loading also failed for one or both encoders: {local_error}")
                     raise RuntimeError(f"Could not load model from {pretrained} (online or local)")
             self.image_processor = AutoImageProcessor.from_pretrained(pretrained)
             
@@ -73,6 +81,10 @@ class TinyVJEPA(nn.Module):
                 
             # Enable gradient checkpointing
             self.encoder.gradient_checkpointing_enable()
+
+            # Initialize target encoder parameters to match context encoder
+            # Moved here as per user's diff structure, ensures early initialization
+            self._initialize_target_encoder()
             
             # logger.info(f"Successfully loaded {pretrained} model") # Moved inside try-except
             
@@ -86,14 +98,17 @@ class TinyVJEPA(nn.Module):
             self.target_encoder.requires_grad_(False)
             if freeze_encoder:
                 self.encoder.requires_grad_(False)
-            # Potentially, initialize an image processor or use default ViT processing logic
+            # Attempt to load image processor in fallback path
+            try:
+                self.image_processor = AutoImageProcessor.from_pretrained(pretrained, local_files_only=True)
+                logger.info(f"Loaded image processor for {pretrained} (fallback path, local attempt).")
+            except Exception as proc_error:
+                logger.warning(f"Could not load image processor for {pretrained} in fallback: {proc_error}. Image processing might fail.")
+                self.image_processor = None # Or a default ViTImageProcessor if applicable
             logger.warning("Using randomly initialized ViT model as fallback due to error.")
         
         # Memory-efficient predictor with layer norm
         try:
-            # Initialize target encoder parameters to match context encoder
-            self._initialize_target_encoder()
-            
             # Enhanced predictor following official V-JEPA patterns
             hidden_dim = 128
             embed_dim = self.encoder.config.hidden_size
@@ -156,7 +171,7 @@ class TinyVJEPA(nn.Module):
         except Exception as e:
             logger.error(f"Error during inference setup: {e}")
 
-    def forward(self, x, x_target=None, masks_context=None, masks_target=None, return_all_features=False):
+    def forward(self, x, x_target=None, masks_context=None, masks_target=None, return_all_features=False): # Applied change
         """Forward pass following official V-JEPA pattern"""
         try:
             B, T = x.shape[:2] # Assuming x is [Batch, Time, Channels, Height, Width]
@@ -166,7 +181,7 @@ class TinyVJEPA(nn.Module):
             if x.device != model_device:
                 x = x.to(model_device)
             if x_target is not None and x_target.device != model_device:
-                x_target = x_target.to(model_device)
+                x_target = x_target.to(model_device) # Applied change
 
 
 
@@ -177,8 +192,8 @@ class TinyVJEPA(nn.Module):
             # If encoder is float16, input should ideally also be float16 or castable
             if self.encoder.dtype == torch.float16 and x.dtype != torch.float16:
                  x = x.to(torch.float16)
-                 if x_target is not None:
-                    x_target = x_target.to(torch.float16)
+                 if x_target is not None: # Applied change
+                    x_target = x_target.to(torch.float16) # Applied change
 
 
             x_flat = x.flatten(0, 1)  # Combine batch and time: [B*T, C, H, W]
@@ -190,12 +205,12 @@ class TinyVJEPA(nn.Module):
                 logger.warning("Empty input to forward pass.")
                 empty_features = torch.zeros(B, T, self.encoder.config.hidden_size, device=model_device, dtype=self.encoder.dtype)
                 if return_all_features:
-                    return self.predictor(empty_features), empty_features, None # Added None for target_features
+                    return self.predictor(empty_features), empty_features, None # Applied change
                 return self.predictor(empty_features)
 
             
             # Checkpoint encoder to save memory
-            # Process context features
+            # Process context features # Applied change
             context_features_list = []
             for i in range(0, x_flat.shape[0], chunk_size):
                 chunk = x_flat[i:i+chunk_size]
@@ -214,13 +229,13 @@ class TinyVJEPA(nn.Module):
                     chunk, 
                     use_reentrant=False # Recommended for newer PyTorch versions for memory efficiency
                 )
-                context_features_list.append(chunk_features)
+                context_features_list.append(chunk_features) # Applied change
             
-            if not context_features_list: # If all chunks were empty or skipped
+            if not context_features_list: # If all chunks were empty or skipped # Applied change
                 logger.warning("No features extracted, possibly due to empty input chunks.")
                 empty_features = torch.zeros(B, T, self.encoder.config.hidden_size, device=model_device, dtype=self.encoder.dtype)
                 if return_all_features:
-                    return self.predictor(empty_features), empty_features, None # Added None for target_features
+                    return self.predictor(empty_features), empty_features, None # Applied change
                 return self.predictor(empty_features)
 
             context_features_cat = torch.cat(context_features_list, dim=0)
@@ -235,11 +250,11 @@ class TinyVJEPA(nn.Module):
             # features = features_cat.unflatten(0, (B, T)) # This would be [B, T, NumPatches+1, HiddenSize]
 
             # If predictor expects a single vector per frame (e.g., CLS token's embedding):
-            context_cls_features = context_features_cat[:, 0, :] # Assuming CLS token is at index 0
-            context_features = context_cls_features.unflatten(0, (B, T)) # Shape: [B, T, HiddenSize]
+            context_cls_features = context_features_cat[:, 0, :] # Assuming CLS token is at index 0 # Applied change
+            context_features = context_cls_features.unflatten(0, (B, T)) # Shape: [B, T, HiddenSize] # Applied change
             
             # Process target features with target encoder if provided
-            target_features = None
+            target_features = None # Applied change
             if x_target is not None:
                 x_target_flat = x_target.flatten(0, 1)
                 target_features_list = []
@@ -250,7 +265,7 @@ class TinyVJEPA(nn.Module):
                         if chunk.nelement() == 0:
                             continue
                             
-                        chunk_features = self.target_encoder(pixel_values=chunk).last_hidden_state
+                        chunk_features = self.target_encoder(pixel_values=chunk).last_hidden_state # Corrected to use target_encoder
                         target_features_list.append(chunk_features)
                 
                 if target_features_list:
@@ -262,10 +277,10 @@ class TinyVJEPA(nn.Module):
             if torch.backends.mps.is_available() and hasattr(torch.mps, 'empty_cache'):
                 torch.mps.empty_cache()
             
-            predicted_features = self.predictor(context_features)
+            predicted_features = self.predictor(context_features) # Applied change
 
             if return_all_features:
-                return predicted_features, context_features, target_features # `features` here is the CLS token embedding per frame
+                return predicted_features, context_features, target_features # `features` here is the CLS token embedding per frame # Applied change
             
             return predicted_features
 

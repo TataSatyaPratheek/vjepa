@@ -206,21 +206,23 @@ class VJEPATrainer(L.LightningModule):
         
         # Generate context and target masks following V-JEPA pattern
         try:
-            masks_context_bool = create_tube_mask(video.shape, self.mask_ratio) # boolean mask
+            masks_context = create_tube_mask(video.shape, self.mask_ratio)  # Returns [B, T, 1, H, W]
             # Target mask can be different, e.g., smaller or sparser, or even full for some VJEPA variants
-            masks_target_bool = create_tube_mask(video.shape, 0.1) # Example: smaller mask ratio for target
+            masks_target = create_tube_mask(video.shape, 0.1)  # Returns [B, T, 1, H, W]
         except Exception as e:
             log.error(f"Error creating mask: {e}")
-            masks_context_bool = torch.ones_like(video[0,0]).bool() # Fallback, assuming C,H,W for mask
-            masks_target_bool = torch.ones_like(video[0,0]).bool()
+            # Fallback masks
+            B, T, C, H, W = video.shape
+            masks_context = torch.ones(B, T, 1, H, W, device=video.device, dtype=torch.bool)
+            masks_target = torch.ones(B, T, 1, H, W, device=video.device, dtype=torch.bool)
         
         # Apply masks
         # For V-JEPA, context is masked, target is usually the original unmasked video for encoding
         video_context = video.clone()
-        # create_tube_mask returns a mask for [T, C, H, W] or [T, H, W]
-        # Assuming create_tube_mask returns [B, T, 1, H, W] or similar, adjust if needed
-        # If masks_context_bool is [B, T, H, W], unsqueeze for channel: masks_context_bool.unsqueeze(2)
-        video_context[~masks_context_bool.unsqueeze(2).expand_as(video)] = 0 # Apply mask where it's False
+        # masks_context is [B, T, 1, H, W] (boolean), expand to [B, T, C, H, W] to match video
+        # Note: create_tube_mask returns float, so we compare with 0. If it returned bool, we'd use ~masks_context_expanded
+        masks_context_expanded = masks_context.expand_as(video)
+        video_context[masks_context_expanded == 0] = 0 # Apply mask where it's 0 (or False if boolean)
         video_target = video # Target video is typically unmasked for the target encoder
 
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -247,26 +249,14 @@ class VJEPATrainer(L.LightningModule):
 
                 # V-JEPA loss: predict target features from context
                 if target_features is not None:
-                    # Ensure masks_target_bool is correctly shaped for feature masking
+                    # Ensure masks_target is correctly shaped for feature masking
                     # pred_features/target_features are [B, T, HiddenDim]
-                    # masks_target_bool is [B, T, H, W] from create_tube_mask
-                    # We need a mask of shape [B, T] for the features.
-                    # This usually means selecting which *patches* or *frames* in the target to predict.
-                    # For simplicity, let's assume masks_target_bool can be reduced to [B,T]
-                    # For V-JEPA, the loss is often computed over *patches* of the target.
-                    # The model's forward pass should ideally return features aligned with these masks.
-                    # If pred_features are [B, T, NumPatches, Dim] and target_features are similar,
-                    # then masks_target needs to be [B, T, NumPatches]
-                    # For now, assuming features are [B,T,Dim] and mask is [B,T]
-                    # This part needs careful alignment with how TinyVJEPA handles masks and returns features.
-                    # Assuming masks_target_bool from create_tube_mask is [B, T, H, W]
-                    # We need to convert this to a mask for features [B, T, Dim]
-                    # A common V-JEPA approach is to mask *target patches* for the loss.
+                    # masks_target is [B, T, 1, H, W] from create_tube_mask (float mask)
                     # The current TinyVJEPA forward returns CLS tokens [B, T, HiddenSize]
                     # So, a mask of [B, T] is appropriate here.
-                    # Let's assume masks_target_bool is effectively a frame-level mask [B,T] for simplicity here.
-                    # If create_tube_mask returns [B,T,H,W], we can take .any() over H,W.
-                    target_frames_mask = masks_target_bool.any(dim=(-1,-2)) # [B,T]
+                    # We need to convert this to a boolean mask for features [B, T]
+                    # A frame is considered for loss if *any* part of it was specified by the target mask.
+                    target_frames_mask = masks_target.squeeze(2).any(dim=(-1, -2))  # [B, T], boolean
 
                     loss = F.mse_loss(
                         pred_features[target_frames_mask],
@@ -283,7 +273,7 @@ class VJEPATrainer(L.LightningModule):
             )
             video_context = None
             if target_features is not None:
-                target_frames_mask = masks_target_bool.any(dim=(-1,-2))
+                target_frames_mask = masks_target.squeeze(2).any(dim=(-1, -2)) # [B,T], boolean
                 loss = F.mse_loss(pred_features[target_frames_mask], target_features[target_frames_mask])
             else:
                 loss = F.mse_loss(pred_features, context_features) if context_features is not None else torch.tensor(0.0, device=pred_features.device)
