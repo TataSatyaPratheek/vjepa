@@ -4,7 +4,6 @@ defaults:
   - model: vjepa_tiny
   - data: hmdb51
   - trainer: m1_optimized
-  - diffusion: latent_diffusion
   - callbacks: default
   - logger: null
   - paths: default
@@ -12,7 +11,7 @@ defaults:
 
 seed: 42
 task_name: "vjepa_hmdb51"
-tags: ["latent_space", "m1_8gb_optimized"]
+tags: ["v_jepa", "m1_8gb_optimized", "predictive_architecture"]
 
 train:
   enable: True
@@ -26,14 +25,23 @@ model:
     frozen: True
     gradient_checkpointing: True
   
+  target_encoder:
+    frozen: True
+    momentum_teacher: 0.996
+  
   predictor:
-    hidden_dim: 128
-    num_layers: 2
+    hidden_dim: 192
+    num_layers: 4
     dropout: 0.1
 
   latent_dim: 192
   mask_ratio: 0.75
   tube_mask: True
+  
+  # V-JEPA specific parameters
+  momentum:
+    start: 0.996
+    end: 1.0
 
 data:
   root_dir: "data/hmdb51/processed"
@@ -45,13 +53,6 @@ data:
   num_frames: 8  # Reduced from 16 for M1 memory
   frame_rate: 5
 
-diffusion:
-  timesteps: 500  # Reduced for faster generation on M1
-  beta_schedule: "linear"
-  unet_channels: [32, 64]  # Smaller channels for M1
-  attention_resolutions: [16]
-  num_res_blocks: 1  # Reduced for M1 memory
-
 optimization:
   lr: 5e-5  # Lower learning rate for stability
   weight_decay: 0.01
@@ -60,7 +61,14 @@ optimization:
   grad_clip: 0.5
   use_amp: True
   accumulate_grad_batches: 4  # Gradient accumulation for effective batch size
+  
+  # V-JEPA momentum scheduling
+  momentum_scheduler:
+    type: "cosine"
+    start_value: 0.996
+    end_value: 1.0
 
 logging:
-  latent_viz_interval: 2000
-  save_samples: 4  # Reduced sample count for M1 memory
+  feature_viz_interval: 2000
+  save_predictions: 4
+  log_momentum: True

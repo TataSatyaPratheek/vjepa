@@ -21,6 +21,8 @@ import time
 import sys
 from colorama import Fore, Style
 import gc
+import numpy as np
+import math
 
 # Configure rich logging
 logging.basicConfig(
@@ -32,6 +34,21 @@ logging.basicConfig(
 
 log = logging.getLogger("vjepa")
 console = Console()
+
+def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_epochs=0,
+                     start_warmup_value=0):
+    """Cosine scheduler for momentum parameter following official V-JEPA"""
+    warmup_schedule = np.array([])
+    warmup_iters = warmup_epochs * niter_per_ep
+    if warmup_epochs > 0:
+        warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
+
+    iters = np.arange(epochs * niter_per_ep - warmup_iters)
+    schedule = final_value + 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters / len(iters)))
+
+    schedule = np.concatenate((warmup_schedule, schedule))
+    assert len(schedule) == epochs * niter_per_ep
+    return schedule
 
 try:
     # Set multiprocessing start method
@@ -146,16 +163,37 @@ class VJEPATrainer(L.LightningModule):
         self.mask_ratio = self.config.get('mask_ratio', 0.75)
         self.accum_grad_batches = self.config.get('accum_grad_batches', 4)
         self.grad_clip_val = self.config.get('grad_clip_val', 1.0)
+
+        # V-JEPA specific parameters
+        self.momentum_start = self.config.get('momentum_start', 0.996)
+        self.momentum_end = self.config.get('momentum_end', 1.0)
+
+        # Initialize momentum scheduler
+        max_epochs = self.config.get('max_epochs', 30)
+        # Placeholder, will be updated in on_train_start based on actual dataloader length
+        steps_per_epoch_initial = self.config.get('steps_per_epoch_initial_guess', 100)
+        self.momentum_schedule = cosine_scheduler(
+            self.momentum_start, self.momentum_end,
+            max_epochs, steps_per_epoch_initial
+        )
         
         log.info(f"Initialized VJEPATrainer with lr={self.lr}, batch_size={self.batch_size}")
-        
-    def on_fit_start(self):
+        log.info(f"Momentum schedule (initial): {self.momentum_start} -> {self.momentum_end}")
+
+    def on_train_start(self):
+        """Update momentum scheduler with actual steps per epoch and log device"""
         # Make sure MPS backend is used if available
         if torch.backends.mps.is_available():
-            
             log.info(f"{Fore.GREEN}Using MPS acceleration!{Style.RESET_ALL}")
         else:
             log.warning(f"{Fore.YELLOW}MPS not available, using CPU{Style.RESET_ALL}")
+        steps_per_epoch = len(self.trainer.train_dataloader) // self.accum_grad_batches
+        max_epochs = self.trainer.max_epochs
+        self.momentum_schedule = cosine_scheduler(
+            self.momentum_start, self.momentum_end,
+            max_epochs, steps_per_epoch
+        )
+        log.info(f"Updated momentum scheduler for {steps_per_epoch} effective steps/epoch, {max_epochs} epochs")
         
     def training_step(self, batch, batch_idx):
         """Training step with memory optimization"""
@@ -166,19 +204,25 @@ class VJEPATrainer(L.LightningModule):
         if self.global_step == 0:
             log.info(f"Video shape: {video.shape}")
         
-        # Generate tube mask
+        # Generate context and target masks following V-JEPA pattern
         try:
-            mask = create_tube_mask(video.shape, self.mask_ratio)
+            masks_context_bool = create_tube_mask(video.shape, self.mask_ratio) # boolean mask
+            # Target mask can be different, e.g., smaller or sparser, or even full for some VJEPA variants
+            masks_target_bool = create_tube_mask(video.shape, 0.1) # Example: smaller mask ratio for target
         except Exception as e:
             log.error(f"Error creating mask: {e}")
-            mask = torch.ones_like(video)  # Fallback
+            masks_context_bool = torch.ones_like(video[0,0]).bool() # Fallback, assuming C,H,W for mask
+            masks_target_bool = torch.ones_like(video[0,0]).bool()
         
-        # Mask video using memory-efficient operations
-        masked_video = video.clone()
-        masked_video[mask == 0] = 0
+        # Apply masks
+        # For V-JEPA, context is masked, target is usually the original unmasked video for encoding
+        video_context = video.clone()
+        # create_tube_mask returns a mask for [T, C, H, W] or [T, H, W]
+        # Assuming create_tube_mask returns [B, T, 1, H, W] or similar, adjust if needed
+        # If masks_context_bool is [B, T, H, W], unsqueeze for channel: masks_context_bool.unsqueeze(2)
+        video_context[~masks_context_bool.unsqueeze(2).expand_as(video)] = 0 # Apply mask where it's False
+        video_target = video # Target video is typically unmasked for the target encoder
 
-        # Free memory
-        mask = None
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         if torch.backends.mps.is_available() and self.global_step % 10 == 0:
             torch.mps.empty_cache()
@@ -190,52 +234,74 @@ class VJEPATrainer(L.LightningModule):
             dtype = torch.float16
 
             with torch.autocast(device_type=device_type, dtype=dtype, enabled=device_type != 'cpu'):
-                pred_features, _ = self.model(masked_video, return_all_features=True)
-                
-                # Free memory
-                masked_video = None
-                
-                with torch.no_grad():
-                    # Process in smaller chunks to handle memory constraints
-                    batch_size, seq_len = video.shape[:2]
-                    chunk_size = min(4, batch_size * seq_len)
-                    target_features_list = []
-                    
-                    flat_video = video.flatten(0, 1)
-                    for i in range(0, flat_video.shape[0], chunk_size):
-                        chunk = flat_video[i:i+chunk_size]
-                        chunk_features = self.model.encoder(chunk).last_hidden_state
-                        target_features_list.append(chunk_features)
-                        
-                    target_features = torch.cat(target_features_list, dim=0)
-                    target_features = target_features.unflatten(0, video.shape[:2])
-                    
-                    # Free memory
-                    flat_video = None
-                    
-                # Use cosine similarity loss which is more effective and memory-efficient
-                loss = 1 - F.cosine_similarity(
-                    pred_features.reshape(-1, pred_features.shape[-1]),
-                    target_features.reshape(-1, target_features.shape[-1]),
-                    dim=1
-                ).mean()
+                # Forward pass with context and target
+                # The model's forward should handle x_target and masks_target
+                pred_features, context_features, target_features = self.model(
+                    x=video_context,  # Masked video for context encoder
+                    x_target=video_target, # Original video for target encoder
+                    # masks_context is implicitly handled by video_context being pre-masked
+                    # masks_target is for the loss calculation, not for target encoder input
+                    return_all_features=True
+                )
+                video_context = None # Free memory
+
+                # V-JEPA loss: predict target features from context
+                if target_features is not None:
+                    # Ensure masks_target_bool is correctly shaped for feature masking
+                    # pred_features/target_features are [B, T, HiddenDim]
+                    # masks_target_bool is [B, T, H, W] from create_tube_mask
+                    # We need a mask of shape [B, T] for the features.
+                    # This usually means selecting which *patches* or *frames* in the target to predict.
+                    # For simplicity, let's assume masks_target_bool can be reduced to [B,T]
+                    # For V-JEPA, the loss is often computed over *patches* of the target.
+                    # The model's forward pass should ideally return features aligned with these masks.
+                    # If pred_features are [B, T, NumPatches, Dim] and target_features are similar,
+                    # then masks_target needs to be [B, T, NumPatches]
+                    # For now, assuming features are [B,T,Dim] and mask is [B,T]
+                    # This part needs careful alignment with how TinyVJEPA handles masks and returns features.
+                    # Assuming masks_target_bool from create_tube_mask is [B, T, H, W]
+                    # We need to convert this to a mask for features [B, T, Dim]
+                    # A common V-JEPA approach is to mask *target patches* for the loss.
+                    # The current TinyVJEPA forward returns CLS tokens [B, T, HiddenSize]
+                    # So, a mask of [B, T] is appropriate here.
+                    # Let's assume masks_target_bool is effectively a frame-level mask [B,T] for simplicity here.
+                    # If create_tube_mask returns [B,T,H,W], we can take .any() over H,W.
+                    target_frames_mask = masks_target_bool.any(dim=(-1,-2)) # [B,T]
+
+                    loss = F.mse_loss(
+                        pred_features[target_frames_mask],
+                        target_features[target_frames_mask]
+                    )
+                else: # Fallback if target_features are not available (e.g. model error)
+                    log.warning("Target features are None, using simplified self-supervised loss.")
+                    loss = F.mse_loss(pred_features, context_features) # Or another appropriate loss
         except Exception as e:
             log.error(f"Error in autocast block: {e}. Trying without autocast...")
             # Fallback without autocast
-            pred_features, _ = self.model(masked_video, return_all_features=True)
-            masked_video = None
-            
-            with torch.no_grad():
-                target_features = self.model.encoder(video.flatten(0, 1)).last_hidden_state
-                target_features = target_features.unflatten(0, video.shape[:2])
-            
-            # Use cosine similarity loss which is more effective and memory-efficient
-            loss = 1 - F.cosine_similarity(
-                pred_features.reshape(-1, pred_features.shape[-1]),
-                target_features.reshape(-1, target_features.shape[-1]),
-                dim=1
-            ).mean()
-        
+            pred_features, context_features, target_features = self.model(
+                x=video_context, x_target=video_target, return_all_features=True
+            )
+            video_context = None
+            if target_features is not None:
+                target_frames_mask = masks_target_bool.any(dim=(-1,-2))
+                loss = F.mse_loss(pred_features[target_frames_mask], target_features[target_frames_mask])
+            else:
+                loss = F.mse_loss(pred_features, context_features) if context_features is not None else torch.tensor(0.0, device=pred_features.device)
+
+        # Update target encoder with momentum
+        current_step_in_epoch = self.global_step % (len(self.trainer.train_dataloader) // self.accum_grad_batches)
+        current_epoch_effective_steps = len(self.trainer.train_dataloader) // self.accum_grad_batches
+        schedule_idx = self.trainer.current_epoch * current_epoch_effective_steps + current_step_in_epoch
+
+        if schedule_idx < len(self.momentum_schedule):
+            momentum = self.momentum_schedule[schedule_idx]
+            self.model.update_target_encoder(momentum)
+        else: # Should not happen if schedule is correctly sized
+            momentum = self.momentum_end 
+            self.model.update_target_encoder(momentum)
+            if self.global_step == 0 : # Log only once if this occurs
+                 log.warning(f"Momentum schedule index {schedule_idx} out of bounds (len {len(self.momentum_schedule)}). Using momentum_end.")
+
         # Handle gradient accumulation
         is_accumulating = (batch_idx + 1) % self.accum_grad_batches != 0
         
@@ -260,8 +326,12 @@ class VJEPATrainer(L.LightningModule):
                 torch.mps.empty_cache()
         
         # Memory-efficient logging
-        metrics = {"train_loss": loss.item()}
-        self.log_dict(metrics, prog_bar=True, on_step=True, on_epoch=True)
+        current_momentum = self.momentum_schedule[schedule_idx] if schedule_idx < len(self.momentum_schedule) else self.momentum_end
+        metrics = {
+            "train_loss": loss.item(),
+            "momentum": current_momentum
+        }
+        self.log_dict(metrics, prog_bar=True, on_step=True, on_epoch=False, logger=True) # Log on step for Tensorboard
         
         # Force clean memory
         if torch.backends.mps.is_available() and batch_idx % 5 == 0:
@@ -317,7 +387,8 @@ def train():
             'num_workers': 1,  # Reduce workers for MacBook
             'accum_grad_batches': 4,  # Accumulate gradients for effective batch size of 4
             'grad_clip_val': 1.0,
-            'max_epochs': 30
+            'max_epochs': 30,
+            # 'steps_per_epoch_initial_guess' will be implicitly handled by on_train_start
         }
         
         console.print("[cyan]Initializing model...[/cyan]")

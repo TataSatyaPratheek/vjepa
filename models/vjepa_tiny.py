@@ -4,7 +4,6 @@ from transformers import ViTModel, AutoImageProcessor
 from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
 import logging
-from models.fallback_vit import FallbackViT
 
 from rich.logging import RichHandler # Assuming rich is installed, otherwise comment out or handle appropriately
 
@@ -23,6 +22,8 @@ if not logger.hasHandlers(): # Avoid adding multiple handlers if re-running in a
 class TinyVJEPA(nn.Module):
     def __init__(self, pretrained="google/vit-base-patch16-224", freeze_encoder=True):
         super().__init__()
+        
+        # Initialize context encoder (x-encoder)
         try:
             # Use safetensors for faster loading and better compatibility
             # Add offline mode and better error handling
@@ -35,6 +36,19 @@ class TinyVJEPA(nn.Module):
                     local_files_only=False,  # Try online first
                     trust_remote_code=False
                 )
+                
+                # Initialize target encoder (y-encoder) - CRITICAL MISSING COMPONENT
+                self.target_encoder = ViTModel.from_pretrained(
+                    pretrained,
+                    use_safetensors=True, 
+                    torch_dtype=torch.float16,
+                    local_files_only=False,
+                    trust_remote_code=False
+                )
+                
+                # Target encoder is always frozen and updated via EMA
+                self.target_encoder.requires_grad_(False)
+                
                 logger.info(f"Successfully loaded pretrained model from {pretrained}")
             except Exception as online_error:
                 logger.warning(f"Online loading failed: {online_error}. Trying local or cached version...")
@@ -68,6 +82,8 @@ class TinyVJEPA(nn.Module):
             from transformers import ViTConfig
             config = ViTConfig(hidden_size=192, num_hidden_layers=6, num_attention_heads=3, intermediate_size=768) # Example config for a tiny ViT
             self.encoder = ViTModel(config)
+            self.target_encoder = ViTModel(config)
+            self.target_encoder.requires_grad_(False)
             if freeze_encoder:
                 self.encoder.requires_grad_(False)
             # Potentially, initialize an image processor or use default ViT processing logic
@@ -75,13 +91,21 @@ class TinyVJEPA(nn.Module):
         
         # Memory-efficient predictor with layer norm
         try:
+            # Initialize target encoder parameters to match context encoder
+            self._initialize_target_encoder()
+            
+            # Enhanced predictor following official V-JEPA patterns
             hidden_dim = 128
             embed_dim = self.encoder.config.hidden_size
+            # More sophisticated predictor as per official implementation
             self.predictor = nn.Sequential(
                 nn.LayerNorm(embed_dim),
                 nn.Linear(embed_dim, hidden_dim),
                 nn.GELU(),
                 nn.Dropout(0.1),  # Add dropout for regularization
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(), 
+                nn.Dropout(0.1),
                 nn.Linear(hidden_dim, embed_dim)
             )
             logger.info(f"Predictor initialized with hidden_dim={hidden_dim}, embed_dim={embed_dim}")
@@ -101,6 +125,18 @@ class TinyVJEPA(nn.Module):
         # For efficient M1 inference
         self._device_setup_done = False
 
+    def _initialize_target_encoder(self):
+        """Initialize target encoder parameters to match context encoder"""
+        with torch.no_grad():
+            for param_q, param_k in zip(self.encoder.parameters(), self.target_encoder.parameters()):
+                param_k.data.copy_(param_q.data)
+
+    def update_target_encoder(self, momentum: float = 0.996):
+        """Update target encoder with momentum (EMA)"""
+        with torch.no_grad():
+            for param_q, param_k in zip(self.encoder.parameters(), self.target_encoder.parameters()):
+                param_k.data.mul_(momentum).add_((1. - momentum) * param_q.detach().data)
+
     def setup_for_inference(self):
         """Configure model for M1 inference"""
         try:
@@ -109,6 +145,8 @@ class TinyVJEPA(nn.Module):
                 # Ensure encoder exists and is a PyTorch module before calling .to()
                 if hasattr(self, 'encoder') and isinstance(self.encoder, nn.Module):
                     self.encoder = self.encoder.to(torch.float16)
+                if hasattr(self, 'target_encoder') and isinstance(self.target_encoder, nn.Module):
+                    self.target_encoder = self.target_encoder.to(torch.float16)
                 self._device_setup_done = True
                 logger.info("Model configured for MPS inference with float16 encoder.")
             elif not torch.backends.mps.is_available():
@@ -118,7 +156,8 @@ class TinyVJEPA(nn.Module):
         except Exception as e:
             logger.error(f"Error during inference setup: {e}")
 
-    def forward(self, x, return_all_features=False):
+    def forward(self, x, x_target=None, masks_context=None, masks_target=None, return_all_features=False):
+        """Forward pass following official V-JEPA pattern"""
         try:
             B, T = x.shape[:2] # Assuming x is [Batch, Time, Channels, Height, Width]
             
@@ -126,6 +165,10 @@ class TinyVJEPA(nn.Module):
             model_device = next(self.encoder.parameters()).device
             if x.device != model_device:
                 x = x.to(model_device)
+            if x_target is not None and x_target.device != model_device:
+                x_target = x_target.to(model_device)
+
+
 
             # If input is float64, cast to float32 (or model's dtype)
             if x.dtype == torch.float64:
@@ -134,22 +177,26 @@ class TinyVJEPA(nn.Module):
             # If encoder is float16, input should ideally also be float16 or castable
             if self.encoder.dtype == torch.float16 and x.dtype != torch.float16:
                  x = x.to(torch.float16)
+                 if x_target is not None:
+                    x_target = x_target.to(torch.float16)
 
 
             x_flat = x.flatten(0, 1)  # Combine batch and time: [B*T, C, H, W]
             
+            # Process context (masked input)
             # Use smaller chunks for M1's limited memory
             chunk_size = min(4, x_flat.shape[0])  # Reduced from 8 to 4 for reliability
             if x_flat.shape[0] == 0: # Handle empty input
                 logger.warning("Empty input to forward pass.")
                 empty_features = torch.zeros(B, T, self.encoder.config.hidden_size, device=model_device, dtype=self.encoder.dtype)
                 if return_all_features:
-                    return self.predictor(empty_features), empty_features
+                    return self.predictor(empty_features), empty_features, None # Added None for target_features
                 return self.predictor(empty_features)
 
             
             # Checkpoint encoder to save memory
-            features_list = []
+            # Process context features
+            context_features_list = []
             for i in range(0, x_flat.shape[0], chunk_size):
                 chunk = x_flat[i:i+chunk_size]
                 # Ensure chunk is not empty and has the right dimensions for the encoder
@@ -167,38 +214,58 @@ class TinyVJEPA(nn.Module):
                     chunk, 
                     use_reentrant=False # Recommended for newer PyTorch versions for memory efficiency
                 )
-                features_list.append(chunk_features)
+                context_features_list.append(chunk_features)
             
-            if not features_list: # If all chunks were empty or skipped
+            if not context_features_list: # If all chunks were empty or skipped
                 logger.warning("No features extracted, possibly due to empty input chunks.")
                 empty_features = torch.zeros(B, T, self.encoder.config.hidden_size, device=model_device, dtype=self.encoder.dtype)
                 if return_all_features:
-                    return self.predictor(empty_features), empty_features
+                    return self.predictor(empty_features), empty_features, None # Added None for target_features
                 return self.predictor(empty_features)
 
-            features_cat = torch.cat(features_list, dim=0)
+            context_features_cat = torch.cat(context_features_list, dim=0)
             # Reshape features back to [B, T, NumPatches, EmbedDim] or [B, T, CLS_Token_EmbedDim]
             # ViT's last_hidden_state is typically [B*T_chunked, NumPatches+1, HiddenSize]
             # We need to know what the predictor expects. Assuming it expects features per frame [B, T, HiddenSize] (e.g., CLS token)
             # If using CLS token, it's features_cat[:, 0, :]
             # For this example, let's assume we average patch embeddings or take CLS
             # For simplicity, if predictor expects [B, T, HiddenSize], we might take the CLS token embedding
-            
+
             # If predictor expects sequence of patch embeddings:
             # features = features_cat.unflatten(0, (B, T)) # This would be [B, T, NumPatches+1, HiddenSize]
 
             # If predictor expects a single vector per frame (e.g., CLS token's embedding):
-            cls_token_features = features_cat[:, 0, :] # Assuming CLS token is at index 0
-            features = cls_token_features.unflatten(0, (B, T)) # Shape: [B, T, HiddenSize]
+            context_cls_features = context_features_cat[:, 0, :] # Assuming CLS token is at index 0
+            context_features = context_cls_features.unflatten(0, (B, T)) # Shape: [B, T, HiddenSize]
+            
+            # Process target features with target encoder if provided
+            target_features = None
+            if x_target is not None:
+                x_target_flat = x_target.flatten(0, 1)
+                target_features_list = []
+                
+                with torch.no_grad():  # Target encoder always in eval mode
+                    for i in range(0, x_target_flat.shape[0], chunk_size):
+                        chunk = x_target_flat[i:i+chunk_size]
+                        if chunk.nelement() == 0:
+                            continue
+                            
+                        chunk_features = self.target_encoder(pixel_values=chunk).last_hidden_state
+                        target_features_list.append(chunk_features)
+                
+                if target_features_list:
+                    target_features_cat = torch.cat(target_features_list, dim=0)
+                    target_cls_features = target_features_cat[:, 0, :]
+                    target_features = target_cls_features.unflatten(0, (B, T))
             
             # Clean up CUDA/MPS memory
             if torch.backends.mps.is_available() and hasattr(torch.mps, 'empty_cache'):
                 torch.mps.empty_cache()
             
-            predicted_features = self.predictor(features)
+            predicted_features = self.predictor(context_features)
 
             if return_all_features:
-                return predicted_features, features # `features` here is the CLS token embedding per frame
+                return predicted_features, context_features, target_features # `features` here is the CLS token embedding per frame
             
             return predicted_features
 
@@ -214,5 +281,6 @@ class TinyVJEPA(nn.Module):
 
             if return_all_features:
                 return torch.zeros(B_fallback, T_fallback, embed_dim_fallback, device=device_fallback), \
-                       torch.zeros(B_fallback, T_fallback, embed_dim_fallback, device=device_fallback)
+                       torch.zeros(B_fallback, T_fallback, embed_dim_fallback, device=device_fallback), \
+                       None # Added None for target_features
             return torch.zeros(B_fallback, T_fallback, embed_dim_fallback, device=device_fallback)
