@@ -1,6 +1,10 @@
-# Video Diffusion Model with Latent JEPA
+An updated `README.md` that aligns with the recent changes in the codebase is provided below. The updates reflect the shift from a generative model to a self-supervised learning and evaluation framework, including a revised project structure, new evaluation scripts, and corrected commands.
 
-This repository contains an implementation of a vision-language joint embedding predictive architecture (JEPA) for video understanding, optimized specifically for M1 MacBook Air (8GB RAM) systems. The model leverages a frozen ViT encoder and lightweight diffusion decoders to learn spatial-temporal representations from video clips.
+***
+
+# Video Joint-Embedding Predictive Architecture (V-JEPA)
+
+This repository contains an implementation of a Video Joint-Embedding Predictive Architecture (V-JEPA) for self-supervised video understanding. The model is optimized to run on M1 MacBook Air systems with 8GB of RAM. It learns spatio-temporal representations from video clips by predicting features in a latent space, using a frozen ViT encoder and a lightweight predictor network.
 
 ## 📋 Table of Contents
 
@@ -10,53 +14,59 @@ This repository contains an implementation of a vision-language joint embedding 
 - [Project Structure](#project-structure)
 - [Dataset Preparation](#dataset-preparation)
 - [Training](#training)
-- [Generating Samples](#generating-samples)
+- [Evaluation](#evaluation)
 - [M1 Optimization Details](#m1-optimization-details)
 - [Troubleshooting](#troubleshooting)
 - [Advanced Usage](#advanced-usage)
+- [Citation](#citation)
+- [Acknowledgments](#acknowledgments)
 
 ## 🌟 Overview
 
-This project implements a hybrid architecture combining:
+This project implements a self-supervised learning architecture combining:
 
-1. **Frozen ViT Encoder**: Uses a pre-trained Vision Transformer as a feature extractor.
-2. **JEPA Training**: Implements masked prediction of video patches for self-supervised learning.
-3. **Latent Diffusion**: Generates new video frames by sampling the learned latent space.
+1.  **Frozen ViT Encoder**: Uses a pre-trained Vision Transformer as a feature extractor to generate representations for video frames.
+2.  **JEPA Training**: Implements a masked prediction task in the latent space, where the model learns to predict features of masked-out portions of a video from the visible context.
+3.  **Downstream Evaluation**: The learned representations are evaluated on downstream tasks like video and image classification using linear probing.
 
-The implementation is specifically optimized for Apple Silicon M1 machines with limited memory, using techniques like gradient checkpointing, mixed-precision training, and efficient attention mechanisms.
+The implementation is specifically optimized for Apple Silicon M1 machines with limited memory, using techniques such as gradient checkpointing, mixed-precision training, and efficient memory management.
 
 ## 💻 Requirements
 
-- Python 3.10+
-- PyTorch 2.1.2
-- M1 Mac with MPS support (optimized for 8GB RAM)
-- HMDB51 dataset or similar video dataset
+-   Python 3.10+
+-   PyTorch
+-   PyTorch Lightning
+-   An M1 Mac with MPS support (optimized for 8GB RAM)
+-   HMDB51 dataset or a similar video dataset
+-   A full list of dependencies is available in `requirements.txt`.
 
 ## 🔧 Installation
 
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/video-jepa.git
-cd video-jepa
-```
+1.  Clone the repository:
+    ```bash
+    git clone https://github.com/TataSatyaPratheek/vjepa.git
+    cd vjepa
+    ```
 
-2. Create a conda environment:
-```bash
-conda create -n vjepa python=3.10
-conda activate vjepa
-```
+2.  Create a conda environment:
+    ```bash
+    conda create -n vjepa python=3.10
+    conda activate vjepa
+    ```
 
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+3.  Install dependencies:
+    ```bash
+    pip install -r requirements.txt
+    ```
 
-4. Verify MPS support:
-```bash
-python -c "import torch; print('MPS available:', torch.backends.mps.is_available())"
-```
+4.  Verify MPS support:
+    ```bash
+    python -c "import torch; print('MPS available:', torch.backends.mps.is_available())"
+    ```
 
 ## 📁 Project Structure
+
+The project structure has been updated to include evaluation scripts and new utilities.
 
 ```
 .
@@ -64,14 +74,18 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 │   └── vjepa_tiny.yaml  # Main configuration
 ├── data/                # Dataset handling
 │   └── dataset.py       # HMDB51 dataset wrapper
+├── evals/               # Evaluation scripts
+│   ├── image_classification.py
+│   └── video_classification.py
 ├── models/              # Model definitions
-│   ├── diffusion_decoder.py  # Latent diffusion decoder
 │   └── vjepa_tiny.py    # ViT-based JEPA model
 ├── utils/               # Utility functions
+│   ├── mask_collators.py
 │   ├── masking.py       # Tube masking for videos
 │   ├── memory.py        # Memory tracking utilities
+│   ├── schedulers.py    # Learning rate and momentum schedulers
 │   └── viz.py           # Visualization tools
-├── generate.py          # Generation script
+├── evaluate.py          # Evaluation script
 ├── train.py             # Training script
 ├── requirements.txt     # Dependencies
 └── README.md            # This file
@@ -79,36 +93,35 @@ python -c "import torch; print('MPS available:', torch.backends.mps.is_available
 
 ## 🎬 Dataset Preparation
 
-This project is configured to use the HMDB51 dataset, but it can be adapted for any video dataset.
+This project is configured for the HMDB51 dataset but can be adapted for other video datasets.
 
 ### Using HMDB51
 
-1. Download the HMDB51 dataset from the [official website](https://serre-lab.clps.brown.edu/resource/hmdb-a-large-human-motion-database/).
+1.  Download the HMDB51 dataset from the [official website](https://serre-lab.clps.brown.edu/resource/hmdb-a-large-human-motion-database/).
 
-2. Extract the dataset into a directory structure as follows:
-```
-data/hmdb51/subset/
-├── brush_hair/         # Action category
-│   ├── video1.mp4
-│   ├── video2.mp4
-│   └── ...
-├── cartwheel/
-│   └── ...
-└── ...                 # Other action categories
-```
+2.  Extract the dataset into a directory. The structure should be as follows:
+    ```
+    /path/to/your/hmdb51/
+    ├── brush_hair/         # Action category
+    │   ├── video1.avi
+    │   └── ...
+    ├── cartwheel/
+    │   └── ...
+    └── ...                 # Other action categories
+    ```
 
-3. Set the environment variable to your dataset location:
-```bash
-export HMDB51_DIR=/path/to/your/hmdb51/subset
-```
+3.  Set the environment variable to your dataset location:
+    ```bash
+    export HMDB51_DIR=/path/to/your/hmdb51
+    ```
 
 ### Using Custom Datasets
 
-To use a different dataset, modify the `HMDB51Wrapper` class in `data/dataset.py` to match your dataset structure. The expected format is a directory containing subdirectories for each class/category, with video files inside.
+To use a different dataset, you can modify the `HMDB51Wrapper` class in `data/dataset.py` to match your dataset's structure.
 
 ## 🚀 Training
 
-To start training with default settings:
+To start training with the default M1-optimized settings:
 
 ```bash
 python train.py
@@ -116,167 +129,94 @@ python train.py
 
 ### Training Options
 
-The training script is configured with sensible defaults for M1 MacBooks with 8GB RAM:
-
-- Batch size: 1 with gradient accumulation of 4 steps
-- Learning rate: 5e-5
-- Maximum epochs: 30
-- Mixed precision (float16)
-- MPS acceleration when available
+The training script is configured with defaults suitable for M1 MacBooks with 8GB RAM:
+-   Batch size: 1 with gradient accumulation of 4 steps
+-   Learning rate: 5e-5
+-   Maximum epochs: 30
+-   Mixed-precision (float16) training
+-   MPS acceleration when available
 
 ### Monitoring Training
 
-The training script provides rich, colorful output with detailed progress information:
+The script provides a rich, colorful console output with detailed progress, including real-time loss, memory usage, and ETA for completion. Training checkpoints are saved to the `checkpoints/` directory, and TensorBoard logs are stored in the `logs/` directory.
 
-- Real-time loss tracking
-- Memory usage statistics
-- ETA for training completion
-- Progress bars with time estimation
+## 🎨 Evaluation
 
-Training checkpoints are saved to the `checkpoints/` directory, with TensorBoard logs in the `logs/` directory.
+After training, you can evaluate the learned representations on downstream classification tasks using the `evaluate.py` script. This script performs linear probing on both video (HMDB51) and image (CIFAR-10) datasets.
 
-### Resuming Training
-
-To resume training from a checkpoint:
+To run the evaluation with a trained checkpoint:
 
 ```bash
-python train.py --resume --ckpt_path checkpoints/vjepa-last.ckpt
+python evaluate.py --checkpoint checkpoints/vjepa-last.ckpt
 ```
 
-## 🎨 Generating Samples
+### Evaluation Options
 
-After training, you can generate new video frames using:
+-   `--checkpoint`: Path to the trained model checkpoint.
+-   `--data_dir`: Path to the video dataset (defaults to `data/hmdb51/subset`).
+-   `--batch_size`: Batch size for evaluation (default: 16).
+-   `--device`: Device to use (`auto`, `cpu`, `cuda`, `mps`).
 
-```bash
-python generate.py --num_samples 2 --output_dir outputs
-```
-
-### Generation Options
-
-- `--num_samples`: Number of samples to generate (default: 2)
-- `--output_dir`: Directory to save generated samples (default: 'outputs')
-- `--encoder_path`: Path to the trained encoder checkpoint
-- `--latent_dim`: Latent dimension size (default: 192)
-
-The generated samples will be saved as PNG images in the specified output directory.
+The script will output the classification accuracy for both tasks.
 
 ## 🍎 M1 Optimization Details
 
-This implementation includes several optimizations specifically for M1 MacBooks with limited memory:
-
-1. **MPS Acceleration**: Uses Apple's Metal Performance Shaders for GPU acceleration
-2. **Memory Management**:
-   - Efficient memory tracking and garbage collection
-   - Low-memory tensor operations with chunked processing
-   - Regular cache clearing to prevent OOM errors
-   
-3. **Model Optimizations**:
-   - Reduced model size with fewer layers and channels
-   - Frozen encoder to reduce memory requirements
-   - Half-precision (float16) for weights and computations
-   - Memory-efficient attention mechanisms
-   
-4. **Training Efficiency**:
-   - Gradient accumulation for effective larger batch sizes
-   - Gradient checkpointing to reduce memory usage
-   - Lightweight predictor with minimal parameters
-   - Batched processing with smaller chunk sizes
+This implementation includes several optimizations for M1 MacBooks with limited memory:
+1.  **MPS Acceleration**: Utilizes Apple's Metal Performance Shaders for GPU acceleration.
+2.  **Memory Management**: Implements efficient memory tracking, periodic garbage collection, and cache clearing to prevent out-of-memory errors.
+3.  **Model Optimizations**: Employs a frozen encoder, a reduced model size, half-precision (float16) computations, and memory-efficient attention mechanisms.
+4.  **Training Efficiency**: Uses gradient accumulation to simulate larger batch sizes, gradient checkpointing to save memory, and a lightweight predictor network.
 
 ## ❓ Troubleshooting
 
 ### Common Issues
 
-1. **Out of Memory Errors**:
-   - Reduce batch size further in `configs/vjepa_tiny.yaml`
-   - Reduce `chunk_size` in model forward passes
-   - Try disabling MPS with `export PYTORCH_ENABLE_MPS_FALLBACK=1`
-
-2. **Slow Training**:
-   - Ensure MPS acceleration is properly enabled
-   - Try adjusting `num_workers` in data loaders
-   - Consider enabling memory caching with `cache_mode='memory'` in HMDB51Wrapper
-
-3. **Dataset Loading Errors**:
-   - Verify dataset path is correct with `HMDB51_DIR` environment variable
-   - Check that video files are compatible formats (mp4, avi, mov)
-   - Ensure PyAV is properly installed with `pip install av`
-
-4. **Model Import Errors**:
-   - Ensure transformers version matches requirements (4.36.2)
-   - Try reinstalling with `pip install -r requirements.txt --force-reinstall`
-
-### Debugging
-
-For advanced debugging, you can increase logging verbosity:
-
-```bash
-python train.py --verbose
-```
-
-To profile memory usage during training:
-
-```bash
-python -m utils.memory
-```
+1.  **Out of Memory Errors**:
+    -   Reduce the batch size in `configs/vjepa_tiny.yaml`.
+    -   Try disabling MPS with `export PYTORCH_ENABLE_MPS_FALLBACK=1`.
+2.  **Slow Training**:
+    -   Ensure MPS acceleration is enabled.
+    -   Adjust `num_workers` in the data loaders in `train.py`.
+    -   Enable memory caching by setting `cache_mode='memory'` in `HMDB51Wrapper` if you have sufficient RAM.
+3.  **Dataset Loading Errors**:
+    -   Verify the `HMDB51_DIR` environment variable points to the correct path.
+    -   Check that video files are in compatible formats (e.g., .mp4, .avi).
+    -   Ensure PyAV is installed correctly (`pip install av`).
 
 ## 🛠️ Advanced Usage
 
 ### Custom Configurations
 
-You can modify the main configuration file `configs/vjepa_tiny.yaml` to adjust:
-
-- Model architecture (latent dimensions, frozen components)
-- Training parameters (learning rate, epochs, etc.)
-- Dataset parameters (frame size, clip length)
-- Diffusion configuration (timesteps, scheduler)
+You can modify the main configuration file `configs/vjepa_tiny.yaml` to adjust model architecture, training parameters, and dataset settings.
 
 ### Custom Tube Masking
 
-The default implementation uses tube masking for temporal consistency. You can modify `utils/masking.py` to experiment with different masking strategies.
+The project uses a tube masking strategy for temporal consistency. You can experiment with different masking approaches by modifying `utils/masking.py` and `utils/mask_collators.py`.
 
 ### Using Pre-trained Models
 
 To use a different pre-trained ViT encoder, modify the `pretrained` parameter in `models/vjepa_tiny.py`:
-
 ```python
 model = TinyVJEPA(pretrained="google/vit-base-patch16-224", freeze_encoder=True)
 ```
 
-### Multi-GPU Training
-
-While this implementation is optimized for single-GPU M1 systems, you can adapt it for multi-GPU training by modifying the Lightning Trainer:
-
-```python
-trainer = L.Trainer(
-    accelerator="gpu",
-    devices=2,  # Use 2 GPUs
-    strategy="ddp",  # Distributed data parallel
-    # ... other settings
-)
-```
-
 ## 📚 Citation
 
-If you use this code in your research, please cite our work:
+If you use this code in your research, please cite the repository:
 
 ```bibtex
 @misc{videojepa2025,
-  author = {Your Name},
-  title = {Video Diffusion Model with Latent JEPA},
+  author = {Satya Pratheek Tata},
+  title = {V-JEPA: A Video Joint-Embedding Predictive Architecture Implementation},
   year = {2025},
   publisher = {GitHub},
   journal = {GitHub repository},
-  howpublished = {\url{https://github.com/yourusername/video-jepa}}
+  howpublished = {\url{https://github.com/TataSatyaPratheek/vjepa}}
 }
 ```
 
 ## 🙏 Acknowledgments
 
-- The ViT implementation is based on HuggingFace's Transformers library
-- The diffusion components are adapted from Diffusers library
-- Training framework utilizes PyTorch Lightning
-- Special thanks to the PyTorch team for MPS support
-
----
-
-Good luck with your video diffusion adventures! For any questions or issues, please open an issue on GitHub or contact the maintainers.
+-   The ViT implementation is based on Hugging Face's `transformers` library.
+-   The training framework utilizes PyTorch Lightning.
+-   Special thanks to the PyTorch team for their work on MPS support.
